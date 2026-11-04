@@ -109,6 +109,12 @@ active_name = state.get("instance")
 
 pending_reply = {}
 notified_perms = set()
+pending_questions = {}
+question_by_short = {}
+question_short = {}
+notified_questions = set()
+custom_wait = {}
+q_seq = 0
 last_assistant = {}
 current_msg = {}
 pinned = {}
@@ -198,12 +204,14 @@ def tg(method, params, retries=3):
 
 def tg_send(chat_id, text, keyboard=None):
     text = text or "(пусто)"
+    result = {}
     while text:
         chunk, text = text[:TG_CHUNK_LIMIT], text[TG_CHUNK_LIMIT:]
         params = {"chat_id": chat_id, "text": chunk}
         if keyboard:
             params["reply_markup"] = json.dumps(keyboard)
-        tg("sendMessage", params)
+        result = tg("sendMessage", params)
+    return result
 
 
 def oc_sessions(inst):
@@ -239,6 +247,18 @@ def oc_session_info(inst, session_id):
         return json.loads(r.read().decode("utf-8"))
 
 
+def oc_delete_session(inst, session_id):
+    try:
+        with http(f"{inst['url']}/session/{session_id}", method="DELETE",
+                  headers=auth_headers(inst)) as r:
+            r.read()
+            return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        raise
+
+
 def oc_providers(inst):
     with http(f"{inst['url']}/config/providers", headers=auth_headers(inst)) as r:
         return json.loads(r.read().decode("utf-8"))
@@ -263,6 +283,7 @@ BOT_COMMANDS = [
     ("where", "id сессии и готовая команда attach"),
     ("new", "новая сессия"),
     ("abort", "прервать текущую сессию"),
+    ("delete", "удалить текущую сессию навсегда"),
     ("clear", "открепить сессию"),
     ("instances", "список инстансов"),
     ("use", "переключить инстанс: /use home"),
@@ -286,9 +307,10 @@ def menu_keyboard():
         [{"text": "Сессии", "callback_data": "sess:list"},
          {"text": "Новая сессия", "callback_data": "sess:new"}],
         [{"text": "Прервать (abort)", "callback_data": "sess:abort"},
-         {"text": "Открепить сессию", "callback_data": "sess:clear"}],
-        [{"text": "Инстансы", "callback_data": "inst:list"},
+         {"text": "Удалить сессию", "callback_data": "sess:delete"}],
+        [{"text": "Открепить сессию", "callback_data": "sess:clear"},
          {"text": "Стоп во все", "callback_data": "sess:stopall"}],
+        [{"text": "Инстансы", "callback_data": "inst:list"}],
         [{"text": "Модель", "callback_data": "model:list"},
          {"text": "Где я", "callback_data": "where"}],
         [{"text": "Помощь", "callback_data": "help"}],
@@ -379,6 +401,264 @@ def check_pending_permissions():
             notify_permission(inst, perm)
 
 
+def q_short_for(name, rid):
+    global q_seq
+    with lock:
+        key = (name, rid)
+        sh = question_short.get(key)
+        if not sh:
+            q_seq += 1
+            sh = format(q_seq, "x")
+            question_short[key] = sh
+            question_by_short[(name, sh)] = rid
+        return sh
+
+
+def clear_question(name, rid):
+    with lock:
+        pending_questions.pop((name, rid), None)
+        notified_questions.discard((name, rid))
+        sh = question_short.pop((name, rid), None)
+        if sh:
+            question_by_short.pop((name, sh), None)
+        for chat, (n, r, qi) in list(custom_wait.items()):
+            if n == name and r == rid:
+                custom_wait.pop(chat, None)
+
+
+def question_text(name, state, qi):
+    qs = state["questions"]
+    q = qs[qi]
+    lines = [f"Вопрос ({name}) {qi + 1}/{len(qs)}"]
+    if q.get("multiple"):
+        lines[0] += " — можно выбрать несколько"
+    if q.get("header"):
+        lines.append(str(q["header"]))
+    lines.append(str(q.get("question") or ""))
+    for i, o in enumerate(q.get("options") or []):
+        label = o.get("label") or ""
+        desc = o.get("description") or ""
+        lines.append(f"{i + 1}. {label}" + (f" — {desc}" if desc else ""))
+    if q.get("custom"):
+        lines.append("Можно ответить своим текстом: кнопка «Свой ответ».")
+    return "\n".join(lines)
+
+
+def question_keyboard(name, state, qi, rid, sh):
+    q = state["questions"][qi]
+    sel = state["selected"].setdefault(qi, set())
+    multiple = bool(q.get("multiple"))
+    act = "t" if multiple else "o"
+    rows = []
+    for oi, o in enumerate(q.get("options") or []):
+        label = o.get("label") or f"вариант {oi + 1}"
+        mark = "✓ " if label in sel else ""
+        rows.append([{"text": (mark + label)[:60],
+                      "callback_data": f"q:{act}:{name}:{sh}:{qi}:{oi}"}])
+    if multiple:
+        rows.append([{"text": "Готово", "callback_data": f"q:g:{name}:{sh}:{qi}"}])
+    if q.get("custom"):
+        rows.append([{"text": "Свой ответ", "callback_data": f"q:c:{name}:{sh}:{qi}"}])
+    rows.append([{"text": "Отклонить", "callback_data": f"q:r:{name}:{sh}"}])
+    return {"inline_keyboard": rows}
+
+
+def send_question(chat, name, rid, qi):
+    with lock:
+        state = pending_questions.get((name, rid))
+    if not state:
+        return
+    sh = q_short_for(name, rid)
+    res = tg_send(chat, question_text(name, state, qi),
+                  keyboard=question_keyboard(name, state, qi, rid, sh))
+    mid = (res.get("result") or {}).get("message_id")
+    if mid:
+        with lock:
+            st = pending_questions.get((name, rid))
+            if st:
+                st.setdefault("msg", {})[qi] = mid
+
+
+def submit_question(name, rid):
+    inst = inst_by_name(name)
+    with lock:
+        state = pending_questions.get((name, rid))
+    if not inst or not state:
+        return
+    answers = [list(a or []) for a in state["answers"]]
+    try:
+        if state.get("v2"):
+            path = f"/api/session/{state['sid']}/question/{rid}/reply"
+        else:
+            path = f"/question/{rid}/reply"
+        with http(f"{inst['url']}{path}", method="POST", body={"answers": answers},
+                  headers=auth_headers(inst)) as r:
+            r.read()
+        print(f"[question:{name}] replied {rid} answers={answers}", flush=True)
+        tg_send(state["chat"], "Ответ на вопрос отправлен.")
+        clear_question(name, rid)
+    except Exception as e:
+        print(f"[question:{name}] reply error: {e}", flush=True)
+        tg_send(state["chat"], f"не удалось ответить на вопрос: {e}")
+
+
+def advance_question(chat, name, rid, qi):
+    with lock:
+        state = pending_questions.get((name, rid))
+        if not state:
+            return
+        nxt = next((i for i in range(len(state["questions"]))
+                    if not state["answers"][i]), None)
+    if nxt is None:
+        submit_question(name, rid)
+    else:
+        send_question(chat, name, rid, nxt)
+
+
+def reject_question(chat, name, rid):
+    inst = inst_by_name(name)
+    with lock:
+        state = pending_questions.get((name, rid))
+    try:
+        if inst and state:
+            if state.get("v2"):
+                path = f"/api/session/{state['sid']}/question/{rid}/reject"
+            else:
+                path = f"/question/{rid}/reject"
+            with http(f"{inst['url']}{path}", method="POST",
+                      headers=auth_headers(inst)) as r:
+                r.read()
+    except Exception as e:
+        print(f"[question:{name}] reject error: {e}", flush=True)
+    tg_send(chat, "Вопрос отклонён.")
+    clear_question(name, rid)
+
+
+def notify_question(inst, props, v2=False):
+    rid = props.get("id")
+    sid = props.get("sessionID")
+    questions = props.get("questions") or []
+    if not rid or not sid or not questions:
+        return
+    name = inst["name"]
+    with lock:
+        if (name, rid) in notified_questions:
+            return
+        notified_questions.add((name, rid))
+        chat = pending_reply.get((name, sid))
+        if not chat:
+            for (c, n), psid in pinned.items():
+                if n == name and psid == sid:
+                    chat = c
+                    break
+        if not chat and ALLOWED_IDS:
+            chat = next(iter(ALLOWED_IDS))
+        if not chat:
+            return
+        pending_questions[(name, rid)] = {
+            "sid": sid,
+            "chat": chat,
+            "questions": questions,
+            "v2": v2,
+            "answers": [None] * len(questions),
+            "selected": {},
+            "msg": {},
+        }
+    print(f"[question:{name}] asked {rid} sid={sid} "
+          f"n={len(questions)} v2={v2}", flush=True)
+    send_question(chat, name, rid, 0)
+
+
+def check_pending_questions():
+    for inst in instances:
+        try:
+            with http(f"{inst['url']}/question", headers=auth_headers(inst),
+                      timeout=8) as r:
+                items = json.loads(r.read().decode("utf-8"))
+            for item in items or []:
+                notify_question(inst, item)
+        except Exception as e:
+            print(f"[question:{inst['name']}] {e}", flush=True)
+        try:
+            with http(f"{inst['url']}/api/question/request",
+                      headers=auth_headers(inst), timeout=8) as r:
+                data = json.loads(r.read().decode("utf-8")).get("data") or []
+            for item in data:
+                notify_question(inst, item, v2=True)
+        except Exception:
+            pass
+
+
+def handle_question_callback(chat_id, data, callback_id=None):
+    parts = data.split(":")
+    if len(parts) < 4:
+        return
+    act, name, sh = parts[1], parts[2], parts[3]
+    with lock:
+        rid = question_by_short.get((name, sh))
+        state = pending_questions.get((name, rid)) if rid else None
+    if not state:
+        tg_send(chat_id, "вопрос уже неактуален")
+        if callback_id:
+            tg("answerCallbackQuery", {"callback_query_id": callback_id})
+        return
+    qi = int(parts[4]) if len(parts) > 4 and parts[4] else None
+    oi = int(parts[5]) if len(parts) > 5 and parts[5] else None
+    try:
+        if act in ("o", "t") and qi is not None and oi is not None:
+            label = (state["questions"][qi].get("options") or [])[oi].get("label") or ""
+            if act == "t":
+                with lock:
+                    sel = state["selected"].setdefault(qi, set())
+                    if label in sel:
+                        sel.discard(label)
+                    else:
+                        sel.add(label)
+                    chosen = sorted(sel)
+                mid = state.get("msg", {}).get(qi)
+                if mid:
+                    tg("editMessageReplyMarkup", {
+                        "chat_id": chat_id,
+                        "message_id": mid,
+                        "reply_markup": json.dumps(
+                            question_keyboard(name, state, qi, rid, sh)),
+                    })
+                if callback_id:
+                    tg("answerCallbackQuery", {
+                        "callback_query_id": callback_id,
+                        "text": "выбрано: " + ", ".join(chosen) if chosen else "ничего не выбрано",
+                    })
+                return
+            with lock:
+                state["answers"][qi] = [label]
+            advance_question(chat_id, name, rid, qi)
+        elif act == "g" and qi is not None:
+            with lock:
+                sel = state["selected"].get(qi) or set()
+                labels = [o.get("label") for o in
+                          state["questions"][qi].get("options") or []]
+                chosen = [l for l in labels if l in sel]
+                if chosen:
+                    state["answers"][qi] = chosen
+            if not chosen:
+                if callback_id:
+                    tg("answerCallbackQuery", {"callback_query_id": callback_id,
+                                               "text": "выбери хотя бы один вариант"})
+                return
+            advance_question(chat_id, name, rid, qi)
+        elif act == "c" and qi is not None:
+            with lock:
+                custom_wait[chat_id] = (name, rid, qi)
+            tg_send(chat_id, "Напиши свой ответ следующим сообщением.")
+        elif act == "r":
+            reject_question(chat_id, name, rid)
+    except Exception as e:
+        print(f"[question:{name}] callback error: {e}", flush=True)
+        tg_send(chat_id, f"ошибка вопроса: {e}")
+    if callback_id:
+        tg("answerCallbackQuery", {"callback_query_id": callback_id})
+
+
 def finish_reply(inst, sid):
     key = (inst["name"], sid)
     with lock:
@@ -418,6 +698,16 @@ def handle_event(inst, ev):
     elif etype == "permission.replied":
         with lock:
             notified_perms.discard(props.get("id") or props.get("requestID"))
+    elif etype == "question.asked":
+        notify_question(inst, props)
+    elif etype == "question.v2.asked":
+        notify_question(inst, ev.get("data") or props, v2=True)
+    elif etype in ("question.replied", "question.v2.replied",
+                   "question.rejected", "question.v2.rejected"):
+        d = ev.get("data") or props
+        rid = d.get("requestID") or d.get("id")
+        if rid:
+            clear_question(inst["name"], rid)
     elif etype == "session.status":
         sid = props.get("sessionID")
         stype = (props.get("status") or {}).get("type")
@@ -465,7 +755,9 @@ def cb_session_list(chat_id, callback_id=None):
         if s["id"] == cur:
             marks += "• "
         rows.append([{"text": marks + title,
-                      "callback_data": f"sess:use:{inst['name']}:{s['id']}"}])
+                      "callback_data": f"sess:use:{inst['name']}:{s['id']}"},
+                     {"text": "×",
+                      "callback_data": f"sess:del:{inst['name']}:{s['id']}"}])
     rows.append([{"text": "← меню", "callback_data": "menu"}])
     tg_send(chat_id, f"Сессии ({inst['name']}):", keyboard={"inline_keyboard": rows})
     if callback_id:
@@ -557,6 +849,71 @@ def cb_session_clear(chat_id, callback_id=None):
         pinned.pop(key, None)
         save_pins()
     tg_send(chat_id, f"сессия откреплена; теперь пишем в последнюю активную ({inst['name']})")
+    if callback_id:
+        tg("answerCallbackQuery", {"callback_query_id": callback_id})
+
+
+def cb_session_delete_prompt(chat_id, inst_name, sid, callback_id=None):
+    inst = inst_by_name(inst_name)
+    if not inst:
+        tg_send(chat_id, f"нет инстанса {inst_name!r}")
+        return
+    try:
+        title = oc_session_info(inst, sid).get("title") or sid
+    except Exception:
+        title = sid
+    tg_send(
+        chat_id,
+        f"Удалить сессию «{title}» ({inst['name']})?\n"
+        f"id: {sid}\nЭто навсегда — из списка сессий она исчезнет.",
+        keyboard={"inline_keyboard": [
+            [{"text": "Да, удалить", "callback_data": f"sess:delyes:{inst['name']}:{sid}"}],
+            [{"text": "Отмена", "callback_data": "sess:list"}],
+        ]},
+    )
+    if callback_id:
+        tg("answerCallbackQuery", {"callback_query_id": callback_id})
+
+
+def cb_session_delete(chat_id, callback_id=None, inst_name=None, sid=None):
+    inst = inst_by_name(inst_name) if inst_name else get_active()
+    if not inst:
+        tg_send(chat_id, f"нет инстанса {inst_name!r}")
+        if callback_id:
+            tg("answerCallbackQuery", {"callback_query_id": callback_id})
+        return
+    name = inst["name"]
+    try:
+        if not sid:
+            with lock:
+                sid = pinned.get((chat_id, name))
+        if not sid:
+            sid = oc_find_session(inst)
+        try:
+            title = oc_session_info(inst, sid).get("title") or sid
+        except Exception:
+            title = sid
+        print(f"[delete:{name}] chat={chat_id} sid={sid}", flush=True)
+        drop_reply(name, sid)
+        try:
+            with http(f"{inst['url']}/session/{sid}/abort", method="POST",
+                      headers=auth_headers(inst)) as r:
+                r.read()
+        except Exception:
+            pass
+        existed = oc_delete_session(inst, sid)
+        with lock:
+            if pinned.get((chat_id, name)) == sid:
+                pinned.pop((chat_id, name), None)
+                save_pins()
+        if existed:
+            tg_send(chat_id, f"Сессия удалена ({name}): «{title}»\n"
+                             f"id: {sid}\nНовые сообщения пойдут в последнюю сессию.",
+                    keyboard=menu_keyboard())
+        else:
+            tg_send(chat_id, f"сессии {sid} уже нет ({name})", keyboard=menu_keyboard())
+    except Exception as e:
+        tg_send(chat_id, f"не удалось удалить сессию: {e}")
     if callback_id:
         tg("answerCallbackQuery", {"callback_query_id": callback_id})
 
@@ -779,12 +1136,22 @@ def handle_callback(cb):
         cb_session_new(chat_id, callback_id)
     elif data == "sess:abort":
         cb_session_abort(chat_id, callback_id)
+    elif data == "sess:delete":
+        cb_session_delete(chat_id, callback_id)
+    elif data.startswith("sess:del:"):
+        name, _, sid = data.split("sess:del:", 1)[1].partition(":")
+        cb_session_delete_prompt(chat_id, name, sid, callback_id)
+    elif data.startswith("sess:delyes:"):
+        name, _, sid = data.split("sess:delyes:", 1)[1].partition(":")
+        cb_session_delete(chat_id, callback_id, name, sid)
     elif data == "sess:clear":
         cb_session_clear(chat_id, callback_id)
     elif data == "sess:stopall":
         cb_session_stopall(chat_id, callback_id)
     elif data == "inst:list":
         cb_instance_list(chat_id, callback_id)
+    elif data.startswith("q:"):
+        handle_question_callback(chat_id, data, callback_id)
     elif data.startswith("perm:"):
         parts = data.split(":", 3)
         if len(parts) == 4:
@@ -829,6 +1196,8 @@ def handle_command(chat_id, text):
         cb_session_new(chat_id)
     elif cmd == "/abort":
         cb_session_abort(chat_id)
+    elif cmd == "/delete":
+        cb_session_delete(chat_id)
     elif cmd in ("/exit", "/clear"):
         cb_session_clear(chat_id)
     elif cmd == "/instances":
@@ -922,6 +1291,21 @@ def bot_loop():
             if from_id not in ALLOWED_IDS:
                 tg_send(chat_id, "Доступ запрещён (бот только для владельца).")
                 continue
+            if not text.startswith("/"):
+                with lock:
+                    pending_custom = custom_wait.pop(chat_id, None)
+            else:
+                pending_custom = None
+            if pending_custom:
+                name, rid, qi = pending_custom
+                with lock:
+                    state = pending_questions.get((name, rid))
+                if state:
+                    state["answers"][qi] = [text]
+                    advance_question(chat_id, name, rid, qi)
+                else:
+                    tg_send(chat_id, "вопрос уже неактуален")
+                continue
             if text.startswith("/"):
                 handle_command(chat_id, text)
             else:
@@ -960,6 +1344,7 @@ def main():
         set_active(healthy[0])
         print(f"активный инстанс не отвечает; переключился на {healthy[0]}", flush=True)
     check_pending_permissions()
+    check_pending_questions()
     for inst in instances:
         threading.Thread(target=event_loop, args=(inst,), daemon=True).start()
     print(f"бот запущен; активен: {get_active()['name']}", flush=True)
