@@ -95,6 +95,7 @@ notified_perms = set()
 last_assistant = {}
 current_msg = {}
 pinned = {}
+busy = {}
 lock = threading.Lock()
 
 
@@ -346,6 +347,18 @@ def check_pending_permissions():
             notify_permission(inst, perm)
 
 
+def finish_reply(inst, sid):
+    key = (inst["name"], sid)
+    with lock:
+        busy.pop(key, None)
+        chat_id = pending_reply.pop(key, None)
+        mid = current_msg.pop(key, None)
+        text = last_assistant.pop(mid, "") if mid else ""
+    if chat_id and text:
+        print(f"[reply:{inst['name']}] chat={chat_id} len={len(text)}", flush=True)
+        tg_send(chat_id, text)
+
+
 def handle_event(inst, ev):
     etype = ev.get("type")
     props = ev.get("properties") or {}
@@ -373,18 +386,20 @@ def handle_event(inst, ev):
     elif etype == "permission.replied":
         with lock:
             notified_perms.discard(props.get("id") or props.get("requestID"))
-    elif etype == "session.idle" or (
-        etype == "session.status"
-        and (props.get("status") or {}).get("type") == "idle"
-    ):
+    elif etype == "session.status":
         sid = props.get("sessionID")
-        with lock:
-            chat_id = pending_reply.pop(key(sid), None)
-            mid = current_msg.pop(key(sid), None)
-            text = last_assistant.pop(mid, "") if mid else ""
-        if chat_id and text:
-            print(f"[reply:{inst['name']}] chat={chat_id} len={len(text)}", flush=True)
-            tg_send(chat_id, text)
+        stype = (props.get("status") or {}).get("type")
+        if not sid:
+            return
+        if stype == "busy":
+            with lock:
+                busy[key(sid)] = True
+        elif stype == "idle":
+            finish_reply(inst, sid)
+    elif etype == "session.idle":
+        sid = props.get("sessionID")
+        if sid:
+            finish_reply(inst, sid)
 
 
 def cb_show_menu(chat_id, callback_id=None):
@@ -408,10 +423,16 @@ def cb_session_list(chat_id, callback_id=None):
     key = (chat_id, inst["name"])
     with lock:
         cur = pinned.get(key)
+        busy_now = {sid for (name, sid) in busy if name == inst["name"]}
     rows = []
     for s in recent:
         title = (s.get("title") or s["id"])[:40]
-        rows.append([{"text": ("• " if s["id"] == cur else "") + title,
+        marks = ""
+        if s["id"] in busy_now:
+            marks += "▶ "
+        if s["id"] == cur:
+            marks += "• "
+        rows.append([{"text": marks + title,
                       "callback_data": f"sess:use:{inst['name']}:{s['id']}"}])
     rows.append([{"text": "← меню", "callback_data": "menu"}])
     tg_send(chat_id, f"Сессии ({inst['name']}):", keyboard={"inline_keyboard": rows})
@@ -441,12 +462,31 @@ def cb_session_new(chat_id, callback_id=None):
 
 def cb_session_abort(chat_id, callback_id=None):
     inst = get_active()
+    key = (chat_id, inst["name"])
     try:
-        sid = target_session(chat_id, inst)
-        with http(f"{inst['url']}/session/{sid}/abort", method="POST",
+        with lock:
+            sid = pinned.get(key)
+            busy_sids = [s for (name, s) in busy if name == inst["name"]]
+        if sid and sid in busy_sids:
+            target = sid
+            note = ""
+        elif sid:
+            if busy_sids:
+                target = busy_sids[0]
+                note = f" (закреплённая {sid} не запущена)"
+            else:
+                target = sid
+                note = " (сессия не запущена)"
+        elif busy_sids:
+            target = busy_sids[0]
+            note = " (авто: работающая сессия)"
+        else:
+            target = oc_find_session(inst)
+            note = " (авто: последняя активная)"
+        with http(f"{inst['url']}/session/{target}/abort", method="POST",
                   headers=auth_headers(inst)) as r:
             json.loads(r.read() or b"{}")
-        tg_send(chat_id, f"abort отправлен: {sid}")
+        tg_send(chat_id, f"abort отправлен: {target}{note}")
     except Exception as e:
         tg_send(chat_id, f"не удалось прервать: {e}")
     if callback_id:
