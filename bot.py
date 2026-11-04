@@ -17,6 +17,23 @@ STATE_PATH = os.path.join(BASE, "bot_state.json")
 LOCK_PATH = os.path.join(BASE, "bot.lock")
 TG_CHUNK_LIMIT = 3800
 ALLOWED_IDS = {458073613}
+STARTED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def bot_version():
+    import subprocess
+    try:
+        rev = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=BASE,
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=BASE,
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+        return rev + ("+dirty" if dirty else "")
+    except Exception:
+        return "unknown"
 
 
 def load_json(path, default):
@@ -239,6 +256,7 @@ BOT_COMMANDS = [
     ("instances", "список инстансов"),
     ("use", "переключить инстанс: /use home"),
     ("stop", "прервать во всех инстансах"),
+    ("version", "версия, pid и активный инстанс"),
 ]
 
 
@@ -482,6 +500,8 @@ def cb_session_abort(chat_id, callback_id=None):
             running = {sid for sid in targets if (name, sid) in busy}
         if not targets:
             targets = {oc_find_session(inst)}
+        print(f"[abort:{name}] chat={chat_id} targets={sorted(targets)} "
+              f"running={sorted(running)} pending={sorted(pending)}", flush=True)
         stopped = []
         for sid in sorted(targets):
             with http(f"{inst['url']}/session/{sid}/abort", method="POST",
@@ -587,6 +607,7 @@ def handle_callback(cb):
     data = (cb.get("data") or "").strip()
     if not chat_id or from_id not in ALLOWED_IDS:
         return
+    print(f"[cb] chat={chat_id} data={data!r}", flush=True)
     if data == "menu":
         cb_show_menu(chat_id, callback_id)
     elif data == "help":
@@ -624,6 +645,7 @@ def handle_callback(cb):
 
 
 def handle_command(chat_id, text):
+    print(f"[cmd] chat={chat_id} text={text[:80]!r}", flush=True)
     parts = text.split()
     cmd = parts[0].lower().split("@")[0]
     if cmd in ("/start", "/menu"):
@@ -648,6 +670,9 @@ def handle_command(chat_id, text):
             tg_send(chat_id, f"нет инстанса {name!r}")
     elif cmd == "/stop":
         cb_session_stopall(chat_id)
+    elif cmd == "/version":
+        tg_send(chat_id, f"pid={os.getpid()} started={STARTED_AT}\n"
+                         f"code={bot_version()}\nactive={get_active()['name']}")
     else:
         tg_send(chat_id, "неизвестная команда; /help — список")
 
