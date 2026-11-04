@@ -29,8 +29,22 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def load_dotenv(path):
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+
+load_dotenv(os.path.join(BASE, ".env"))
+
 CFG = load_json(CONFIG_PATH, {})
-TOKEN = (CFG.get("bot_token") or "").strip()
+TOKEN = (os.environ.get("BOT_TOKEN") or CFG.get("bot_token") or "").strip()
 
 instances = list(CFG.get("instances") or [])
 
@@ -85,6 +99,9 @@ def set_active(name):
 def auth_headers(inst):
     headers = {}
     pw = inst.get("password") or ""
+    env_key = inst.get("password_env")
+    if not pw and env_key:
+        pw = os.environ.get(env_key) or ""
     if pw:
         import base64
         user = inst.get("username") or "opencode"

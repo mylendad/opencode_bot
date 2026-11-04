@@ -1,0 +1,8 @@
+{
+  "instances": [
+    { "name": "vps", "url": "http://127.0.0.1:4096", "password_env": "OC_VPS_PASSWORD" },
+    { "name": "home", "url": "http://127.0.0.1:4097", "password_env": "OC_HOME_PASSWORD" }
+  ],
+  "send_replies_to_telegram": true,
+  "agent": ""
+}
