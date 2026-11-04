@@ -12,26 +12,6 @@ import urllib.request
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config.json")
 STATE_PATH = os.path.join(BASE, "bot_state.json")
-TELEGRAM_API = "https://api.telegram.org"
-_tg_base = os.environ.get("TELEGRAM_API", "").strip()
-if _tg_base:
-    TELEGRAM_API = _tg_base
-TG_CTX = ssl._create_unverified_context() if "127.0.0.1" in TELEGRAM_API else None
-
-TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY", "").strip()
-tg_opener = None
-if TELEGRAM_PROXY:
-    tg_ctx = ssl._create_unverified_context()
-    tg_opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({"http": TELEGRAM_PROXY, "https": TELEGRAM_PROXY}),
-        urllib.request.HTTPSHandler(context=tg_ctx),
-    )
-
-
-def _tg_open(req, timeout=70):
-    if tg_opener is not None:
-        return tg_opener.open(req, timeout=timeout)
-    return urllib.request.urlopen(req, timeout=timeout, context=TG_CTX)
 TG_CHUNK_LIMIT = 3800
 ALLOWED_IDS = {458073613}
 
@@ -62,6 +42,24 @@ def load_dotenv(path):
 
 
 load_dotenv(os.path.join(BASE, ".env"))
+
+TELEGRAM_API = os.environ.get("TELEGRAM_API", "").strip() or "https://api.telegram.org"
+TG_CTX = ssl._create_unverified_context() if "127.0.0.1" in TELEGRAM_API else None
+
+TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY", "").strip()
+tg_opener = None
+if TELEGRAM_PROXY:
+    tg_ctx = ssl._create_unverified_context()
+    tg_opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": TELEGRAM_PROXY, "https": TELEGRAM_PROXY}),
+        urllib.request.HTTPSHandler(context=tg_ctx),
+    )
+
+
+def _tg_open(req, timeout=70):
+    if tg_opener is not None:
+        return tg_opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout, context=TG_CTX)
 
 CFG = load_json(CONFIG_PATH, {})
 TOKEN = (os.environ.get("BOT_TOKEN") or CFG.get("bot_token") or "").strip()
