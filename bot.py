@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import fcntl
 import json
 import os
 import ssl
@@ -10,8 +11,10 @@ import urllib.parse
 import urllib.request
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+_lock_fd = None
 CONFIG_PATH = os.path.join(BASE, "config.json")
 STATE_PATH = os.path.join(BASE, "bot_state.json")
+LOCK_PATH = os.path.join(BASE, "bot.lock")
 TG_CHUNK_LIMIT = 3800
 ALLOWED_IDS = {458073613}
 
@@ -25,8 +28,26 @@ def load_json(path, default):
 
 
 def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def acquire_singleton():
+    global _lock_fd
+    if _lock_fd is not None:
+        return
+    _lock_fd = open(LOCK_PATH, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("бот уже запущен: занят bot.lock", file=sys.stderr)
+        sys.exit(1)
+    _lock_fd.seek(0)
+    _lock_fd.truncate()
+    _lock_fd.write(str(os.getpid()))
+    _lock_fd.flush()
 
 
 def load_dotenv(path):
@@ -70,6 +91,7 @@ state = load_json(STATE_PATH, {})
 active_name = state.get("instance")
 
 pending_reply = {}
+notified_perms = set()
 last_assistant = {}
 current_msg = {}
 pinned = {}
@@ -184,6 +206,16 @@ def oc_find_session(inst):
     return recent[0]["id"]
 
 
+def oc_session_exists(inst, session_id):
+    try:
+        with http(f"{inst['url']}/session/{session_id}", headers=auth_headers(inst)) as r:
+            return r.status == 200
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        raise
+
+
 def oc_send_prompt(inst, session_id, text):
     body = {"parts": [{"type": "text", "text": text}]}
     if CFG.get("agent"):
@@ -235,7 +267,12 @@ def target_session(chat_id, inst):
     with lock:
         sid = pinned.get(key)
     if sid:
-        return sid
+        if oc_session_exists(inst, sid):
+            return sid
+        with lock:
+            pinned.pop(key, None)
+            save_pins()
+        print(f"[pin:{inst['name']}] удалена несуществующая сессия {sid}", flush=True)
     return oc_find_session(inst)
 
 
@@ -264,6 +301,51 @@ def event_loop(inst):
             time.sleep(3)
 
 
+def notify_permission(inst, props):
+    pid = props.get("id")
+    sid = props.get("sessionID")
+    if not pid or not sid:
+        return
+    with lock:
+        if pid in notified_perms:
+            return
+        chat_id = pending_reply.get((inst["name"], sid))
+        if not chat_id:
+            for (chat, name), pinned_sid in pinned.items():
+                if name == inst["name"] and pinned_sid == sid:
+                    chat_id = chat
+                    break
+        if not chat_id and ALLOWED_IDS:
+            chat_id = next(iter(ALLOWED_IDS))
+        if not chat_id:
+            return
+        notified_perms.add(pid)
+    pattern = props.get("permission") or "permission"
+    patterns = props.get("patterns") or []
+    details = "\n".join(str(p) for p in patterns[:8])
+    text = f"Требуется разрешение ({inst['name']}): {pattern}"
+    if details:
+        text += f"\n{details}"
+    keyboard = {"inline_keyboard": [
+        [{"text": "Разрешить", "callback_data": f"perm:once:{inst['name']}:{pid}"},
+         {"text": "Всегда", "callback_data": f"perm:always:{inst['name']}:{pid}"}],
+        [{"text": "Отклонить", "callback_data": f"perm:reject:{inst['name']}:{pid}"}],
+    ]}
+    tg_send(chat_id, text, keyboard=keyboard)
+
+
+def check_pending_permissions():
+    for inst in instances:
+        try:
+            with http(f"{inst['url']}/permission", headers=auth_headers(inst), timeout=8) as r:
+                perms = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            print(f"[perm:{inst['name']}] {e}", flush=True)
+            continue
+        for perm in perms or []:
+            notify_permission(inst, perm)
+
+
 def handle_event(inst, ev):
     etype = ev.get("type")
     props = ev.get("properties") or {}
@@ -286,6 +368,11 @@ def handle_event(inst, ev):
             with lock:
                 if sid and current_msg.get(key(sid)) == mid:
                     last_assistant[mid] = part["text"]
+    elif etype == "permission.asked":
+        notify_permission(inst, props)
+    elif etype == "permission.replied":
+        with lock:
+            notified_perms.discard(props.get("id") or props.get("requestID"))
     elif etype == "session.idle" or (
         etype == "session.status"
         and (props.get("status") or {}).get("type") == "idle"
@@ -325,7 +412,7 @@ def cb_session_list(chat_id, callback_id=None):
     for s in recent:
         title = (s.get("title") or s["id"])[:40]
         rows.append([{"text": ("• " if s["id"] == cur else "") + title,
-                      "callback_data": f"sess:use:{s['id']}"}])
+                      "callback_data": f"sess:use:{inst['name']}:{s['id']}"}])
     rows.append([{"text": "← меню", "callback_data": "menu"}])
     tg_send(chat_id, f"Сессии ({inst['name']}):", keyboard={"inline_keyboard": rows})
     if callback_id:
@@ -418,10 +505,30 @@ def cb_instance_list(chat_id, callback_id=None):
 
 def cb_instance_use(chat_id, name, callback_id=None):
     if set_active(name):
-        break_replies = True
         tg_send(chat_id, f"переключился на {name}", keyboard=menu_keyboard())
     else:
         tg_send(chat_id, f"нет инстанса {name!r}")
+    if callback_id:
+        tg("answerCallbackQuery", {"callback_query_id": callback_id})
+
+
+def cb_permission_reply(chat_id, action, name, pid, callback_id=None):
+    inst = inst_by_name(name)
+    if not inst:
+        tg_send(chat_id, f"нет инстанса {name!r}")
+    elif action not in ("once", "always", "reject"):
+        tg_send(chat_id, f"неизвестное действие {action!r}")
+    else:
+        try:
+            with http(f"{inst['url']}/permission/{pid}/reply", method="POST",
+                      body={"reply": action}, headers=auth_headers(inst)) as r:
+                r.read()
+            labels = {"once": "разрешено", "always": "разрешено всегда", "reject": "отклонено"}
+            tg_send(chat_id, f"Разрешение {labels[action]} ({name})")
+            with lock:
+                notified_perms.discard(pid)
+        except Exception as e:
+            tg_send(chat_id, f"не удалось ответить на разрешение: {e}")
     if callback_id:
         tg("answerCallbackQuery", {"callback_query_id": callback_id})
 
@@ -449,14 +556,20 @@ def handle_callback(cb):
         cb_session_stopall(chat_id, callback_id)
     elif data == "inst:list":
         cb_instance_list(chat_id, callback_id)
+    elif data.startswith("perm:"):
+        parts = data.split(":", 3)
+        if len(parts) == 4:
+            cb_permission_reply(chat_id, parts[1], parts[2], parts[3], callback_id)
     elif data.startswith("sess:use:"):
-        sid = data.split("sess:use:", 1)[1]
-        inst = get_active()
-        with lock:
-            pinned[(chat_id, inst["name"])] = sid
-            save_pins()
-        saver = f"Сессия закреплена ({inst['name']}). Пишите — уйдёт в неё."
-        tg_send(chat_id, saver)
+        name, _, sid = data.split("sess:use:", 1)[1].partition(":")
+        inst = inst_by_name(name)
+        if not inst:
+            tg_send(chat_id, f"нет инстанса {name!r}")
+        else:
+            with lock:
+                pinned[(chat_id, inst["name"])] = sid
+                save_pins()
+            tg_send(chat_id, f"Сессия закреплена ({inst['name']}). Пишите — уйдёт в неё.")
         if callback_id:
             tg("answerCallbackQuery", {"callback_query_id": callback_id})
     elif data.startswith("inst:use:"):
@@ -497,14 +610,30 @@ def prompt_flow(chat_id, text):
     try:
         sid = target_session(chat_id, inst)
         print(f"[inject:{inst['name']}] chat={chat_id} sid={sid} text={text[:50]!r}", flush=True)
-        with lock:
-            pending_reply[(inst["name"], sid)] = chat_id
     except Exception as e:
         pending_reply.clear()
         tg_send(chat_id, f"ошибка opencode ({inst['name']}): {e}")
         return
+
+    def send(target_sid):
+        with lock:
+            pending_reply[(inst["name"], target_sid)] = chat_id
+        oc_send_prompt(inst, target_sid, text)
+
     try:
-        oc_send_prompt(inst, sid, text)
+        try:
+            send(sid)
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            with lock:
+                pending_reply.pop((inst["name"], sid), None)
+                if pinned.get((chat_id, inst["name"])) == sid:
+                    pinned.pop((chat_id, inst["name"]), None)
+                    save_pins()
+            sid = oc_find_session(inst)
+            print(f"[inject:{inst['name']}] сессия пропала, повтор в {sid}", flush=True)
+            send(sid)
         pinned_title = " (закреплена)" if (chat_id, inst["name"]) in pinned else ""
         tg_send(chat_id, f"отправлено в {inst['name']}{pinned_title}")
     except Exception as e:
@@ -544,6 +673,7 @@ def bot_loop():
 
 
 def main():
+    acquire_singleton()
     if not TOKEN or "PASTE_TOKEN" in TOKEN:
         print("нет bot_token в config.json", file=sys.stderr)
         sys.exit(1)
@@ -573,6 +703,7 @@ def main():
     if get_active()["name"] not in healthy and healthy:
         set_active(healthy[0])
         print(f"активный инстанс не отвечает; переключился на {healthy[0]}", flush=True)
+    check_pending_permissions()
     for inst in instances:
         threading.Thread(target=event_loop, args=(inst,), daemon=True).start()
     print(f"бот запущен; активен: {get_active()['name']}", flush=True)
