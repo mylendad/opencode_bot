@@ -460,33 +460,39 @@ def cb_session_new(chat_id, callback_id=None):
         tg("answerCallbackQuery", {"callback_query_id": callback_id})
 
 
+def drop_reply(inst_name, sid):
+    with lock:
+        pending_reply.pop((inst_name, sid), None)
+        mid = current_msg.pop((inst_name, sid), None)
+        if mid:
+            last_assistant.pop(mid, None)
+
+
 def cb_session_abort(chat_id, callback_id=None):
     inst = get_active()
-    key = (chat_id, inst["name"])
+    name = inst["name"]
     try:
         with lock:
-            sid = pinned.get(key)
-            busy_sids = [s for (name, s) in busy if name == inst["name"]]
-        if sid and sid in busy_sids:
-            target = sid
-            note = ""
-        elif sid:
-            if busy_sids:
-                target = busy_sids[0]
-                note = f" (закреплённая {sid} не запущена)"
+            pending = {sid for (n, sid), chat in pending_reply.items()
+                       if n == name and chat == chat_id}
+            targets = set(pending)
+            sid = pinned.get((chat_id, name))
+            if sid:
+                targets.add(sid)
+            running = {sid for sid in targets if (name, sid) in busy}
+        if not targets:
+            targets = {oc_find_session(inst)}
+        stopped = []
+        for sid in sorted(targets):
+            with http(f"{inst['url']}/session/{sid}/abort", method="POST",
+                      headers=auth_headers(inst)) as r:
+                r.read()
+            if sid in running or sid in pending:
+                drop_reply(name, sid)
+                stopped.append(sid)
             else:
-                target = sid
-                note = " (сессия не запущена)"
-        elif busy_sids:
-            target = busy_sids[0]
-            note = " (авто: работающая сессия)"
-        else:
-            target = oc_find_session(inst)
-            note = " (авто: последняя активная)"
-        with http(f"{inst['url']}/session/{target}/abort", method="POST",
-                  headers=auth_headers(inst)) as r:
-            json.loads(r.read() or b"{}")
-        tg_send(chat_id, f"abort отправлен: {target}{note}")
+                stopped.append(f"{sid} (не запущена)")
+        tg_send(chat_id, "abort отправлен: " + ", ".join(stopped))
     except Exception as e:
         tg_send(chat_id, f"не удалось прервать: {e}")
     if callback_id:
@@ -512,6 +518,7 @@ def cb_session_stopall(chat_id, callback_id=None):
             with http(f"{inst['url']}/session/{sid}/abort", method="POST",
                       headers=auth_headers(inst)) as r:
                 r.read()
+            drop_reply(inst["name"], sid)
             stopped.append(inst["name"])
         except Exception:
             pass
