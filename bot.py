@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import ssl
 import sys
 import threading
 import time
@@ -12,6 +13,25 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config.json")
 STATE_PATH = os.path.join(BASE, "bot_state.json")
 TELEGRAM_API = "https://api.telegram.org"
+_tg_base = os.environ.get("TELEGRAM_API", "").strip()
+if _tg_base:
+    TELEGRAM_API = _tg_base
+TG_CTX = ssl._create_unverified_context() if "127.0.0.1" in TELEGRAM_API else None
+
+TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY", "").strip()
+tg_opener = None
+if TELEGRAM_PROXY:
+    tg_ctx = ssl._create_unverified_context()
+    tg_opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": TELEGRAM_PROXY, "https": TELEGRAM_PROXY}),
+        urllib.request.HTTPSHandler(context=tg_ctx),
+    )
+
+
+def _tg_open(req, timeout=70):
+    if tg_opener is not None:
+        return tg_opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout, context=TG_CTX)
 TG_CHUNK_LIMIT = 3800
 ALLOWED_IDS = {458073613}
 
@@ -126,9 +146,10 @@ def tg(method, params, retries=3):
     url = f"{TELEGRAM_API}/bot{TOKEN}/{method}"
     data = urllib.parse.urlencode(params).encode("utf-8")
     last_err = None
+    req = urllib.request.Request(url, data=data)
     for _ in range(retries):
         try:
-            with urllib.request.urlopen(url, data=data, timeout=70) as r:
+            with _tg_open(req) as r:
                 return json.loads(r.read().decode("utf-8"))
         except Exception as e:
             last_err = e
@@ -450,7 +471,7 @@ def bot_loop():
     while True:
         try:
             url = f"{TELEGRAM_API}/bot{TOKEN}/getUpdates?timeout=50&offset={offset + 1}"
-            with urllib.request.urlopen(url, timeout=70) as r:
+            with _tg_open(urllib.request.Request(url)) as r:
                 payload = json.loads(r.read().decode("utf-8"))
         except Exception as e:
             print(f"[tg] getUpdates failed: {e}", flush=True)
