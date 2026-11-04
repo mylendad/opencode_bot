@@ -387,7 +387,7 @@ def finish_reply(inst, sid):
         mid = current_msg.pop(key, None)
         text = last_assistant.pop(mid, "") if mid else ""
     if chat_id and text:
-        print(f"[reply:{inst['name']}] chat={chat_id} len={len(text)}", flush=True)
+        print(f"[reply:{inst['name']}] chat={chat_id} sid={sid} len={len(text)}", flush=True)
         tg_send(chat_id, text)
 
 
@@ -502,31 +502,48 @@ def drop_reply(inst_name, sid):
 
 def cb_session_abort(chat_id, callback_id=None):
     inst = get_active()
-    name = inst["name"]
     try:
         with lock:
-            pending = {sid for (n, sid), chat in pending_reply.items()
-                       if n == name and chat == chat_id}
-            targets = set(pending)
-            sid = pinned.get((chat_id, name))
-            if sid:
-                targets.add(sid)
-            running = {sid for sid in targets if (name, sid) in busy}
-        if not targets:
-            targets = {oc_find_session(inst)}
-        print(f"[abort:{name}] chat={chat_id} targets={sorted(targets)} "
+            pairs = {(n, sid) for (n, sid), chat in pending_reply.items()
+                     if chat == chat_id}
+            for (chat, n), sid in pinned.items():
+                if chat == chat_id:
+                    pairs.add((n, sid))
+            running = {sid for (n, sid) in pairs if (n, sid) in busy}
+            pending = {sid for (n, sid) in pairs if (n, sid) in pending_reply}
+        if not pairs:
+            pairs = {(inst["name"], oc_find_session(inst))}
+        print(f"[abort:{inst['name']}] chat={chat_id} "
+              f"targets={sorted(f'{n}:{sid}' for n, sid in pairs)} "
               f"running={sorted(running)} pending={sorted(pending)}", flush=True)
-        stopped = []
-        for sid in sorted(targets):
-            with http(f"{inst['url']}/session/{sid}/abort", method="POST",
-                      headers=auth_headers(inst)) as r:
-                r.read()
+
+        for n, sid in pairs:
+            drop_reply(n, sid)
+
+        stopped, idle = [], []
+        for n, sid in sorted(pairs):
+            target = inst_by_name(n)
+            if not target:
+                continue
+            try:
+                with http(f"{target['url']}/session/{sid}/abort", method="POST",
+                          headers=auth_headers(target)) as r:
+                    r.read()
+            except Exception:
+                continue
             if sid in running or sid in pending:
-                drop_reply(name, sid)
-                stopped.append(sid)
+                stopped.append(f"{n}:{sid}")
             else:
-                stopped.append(f"{sid} (не запущена)")
-        tg_send(chat_id, "abort отправлен: " + ", ".join(stopped))
+                idle.append(f"{n}:{sid}")
+
+        if stopped:
+            tg_send(chat_id, "прервано: " + ", ".join(stopped))
+        elif idle:
+            tg_send(chat_id, "нечего прерывать: сессия уже не генерирует "
+                             "(ответ мог успеть завершиться). Новое сообщение "
+                             "запустит новый ответ.")
+        else:
+            tg_send(chat_id, "не удалось прервать: инстанс недоступен")
     except Exception as e:
         tg_send(chat_id, f"не удалось прервать: {e}")
     if callback_id:
@@ -545,21 +562,30 @@ def cb_session_clear(chat_id, callback_id=None):
 
 
 def cb_session_stopall(chat_id, callback_id=None):
+    with lock:
+        pairs = {(n, sid) for (n, sid), chat in pending_reply.items()
+                 if chat == chat_id}
+        for (chat, n), sid in pinned.items():
+            if chat == chat_id:
+                pairs.add((n, sid))
+    for n, sid in pairs:
+        drop_reply(n, sid)
     stopped = []
-    for inst in instances:
+    for n, sid in sorted(pairs):
+        target = inst_by_name(n)
+        if not target:
+            continue
         try:
-            sid = oc_find_session(inst)
-            with http(f"{inst['url']}/session/{sid}/abort", method="POST",
-                      headers=auth_headers(inst)) as r:
+            with http(f"{target['url']}/session/{sid}/abort", method="POST",
+                      headers=auth_headers(target)) as r:
                 r.read()
-            drop_reply(inst["name"], sid)
-            stopped.append(inst["name"])
+            stopped.append(f"{n}:{sid}")
         except Exception:
             pass
     if stopped:
-        tg_send(chat_id, "abort отправлен: " + ", ".join(stopped))
+        tg_send(chat_id, "прервано: " + ", ".join(stopped))
     else:
-        tg_send(chat_id, "не удалось отправить abort ни в один инстанс")
+        tg_send(chat_id, "нечего прерывать: активных запросов нет")
     if callback_id:
         tg("answerCallbackQuery", {"callback_query_id": callback_id})
 
