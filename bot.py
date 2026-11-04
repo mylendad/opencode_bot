@@ -234,6 +234,16 @@ def oc_session_exists(inst, session_id):
         raise
 
 
+def oc_session_info(inst, session_id):
+    with http(f"{inst['url']}/session/{session_id}", headers=auth_headers(inst)) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def oc_providers(inst):
+    with http(f"{inst['url']}/config/providers", headers=auth_headers(inst)) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
 def oc_send_prompt(inst, session_id, text):
     body = {"parts": [{"type": "text", "text": text}]}
     if CFG.get("agent"):
@@ -250,11 +260,13 @@ BOT_COMMANDS = [
     ("menu", "меню управления"),
     ("help", "список команд"),
     ("sessions", "список сессий"),
+    ("where", "id сессии и готовая команда attach"),
     ("new", "новая сессия"),
     ("abort", "прервать текущую сессию"),
     ("clear", "открепить сессию"),
     ("instances", "список инстансов"),
     ("use", "переключить инстанс: /use home"),
+    ("model", "модель: /model или /model provider/id"),
     ("stop", "прервать во всех инстансах"),
     ("version", "версия, pid и активный инстанс"),
 ]
@@ -277,6 +289,8 @@ def menu_keyboard():
          {"text": "Открепить сессию", "callback_data": "sess:clear"}],
         [{"text": "Инстансы", "callback_data": "inst:list"},
          {"text": "Стоп во все", "callback_data": "sess:stopall"}],
+        [{"text": "Модель", "callback_data": "model:list"},
+         {"text": "Где я", "callback_data": "where"}],
         [{"text": "Помощь", "callback_data": "help"}],
     ]}
 
@@ -556,6 +570,32 @@ def cb_help(chat_id, callback_id=None):
         tg("answerCallbackQuery", {"callback_query_id": callback_id})
 
 
+def cb_where(chat_id, callback_id=None):
+    inst = get_active()
+    try:
+        sid = target_session(chat_id, inst)
+        info = oc_session_info(inst, sid)
+    except Exception as e:
+        tg_send(chat_id, f"не удалось определить сессию ({inst['name']}): {e}")
+        if callback_id:
+            tg("answerCallbackQuery", {"callback_query_id": callback_id})
+        return
+    title = info.get("title") or "(без названия)"
+    model = info.get("model") or {}
+    current = f"{model.get('providerID')}/{model.get('id')}" if model else "по умолчанию"
+    url = inst.get("attach_url") or inst["url"]
+    text = (
+        f"Инстанс: {inst['name']}\n"
+        f"Сессия: {title}\n"
+        f"id: {sid}\n"
+        f"Модель: {current}\n\n"
+        f"attach:\nopencode attach {url} -s {sid}"
+    )
+    tg_send(chat_id, text)
+    if callback_id:
+        tg("answerCallbackQuery", {"callback_query_id": callback_id})
+
+
 def cb_instance_list(chat_id, callback_id=None):
     inst = get_active()
     rows = []
@@ -600,6 +640,99 @@ def cb_permission_reply(chat_id, action, name, pid, callback_id=None):
         tg("answerCallbackQuery", {"callback_query_id": callback_id})
 
 
+def cb_model_list(chat_id, callback_id=None):
+    inst = get_active()
+    try:
+        sid = target_session(chat_id, inst)
+        data = oc_providers(inst)
+        info = oc_session_info(inst, sid)
+    except Exception as e:
+        tg_send(chat_id, f"не удалось получить модели: {e}")
+        if callback_id:
+            tg("answerCallbackQuery", {"callback_query_id": callback_id})
+        return
+    model = info.get("model") or {}
+    current = f"{model.get('providerID')}/{model.get('id')}" if model else "по умолчанию"
+    rows = []
+    for p in data.get("providers") or []:
+        models = p.get("models") or {}
+        rows.append([{"text": f"{p.get('name') or p['id']} ({len(models)})",
+                      "callback_data": f"model:p:{p['id']}:0"}])
+    rows.append([{"text": "← меню", "callback_data": "menu"}])
+    tg_send(chat_id, f"Модель ({inst['name']}, {sid})\nСейчас: {current}\nПровайдер:",
+            keyboard={"inline_keyboard": rows})
+    if callback_id:
+        tg("answerCallbackQuery", {"callback_query_id": callback_id})
+
+
+def cb_model_page(chat_id, provider_id, page, callback_id=None):
+    inst = get_active()
+    try:
+        sid = target_session(chat_id, inst)
+        data = oc_providers(inst)
+        info = oc_session_info(inst, sid)
+        provider = next(p for p in data.get("providers") or [] if p["id"] == provider_id)
+    except Exception as e:
+        tg_send(chat_id, f"не удалось получить модели: {e}")
+        if callback_id:
+            tg("answerCallbackQuery", {"callback_query_id": callback_id})
+        return
+    models = sorted((provider.get("models") or {}).values(), key=lambda m: m.get("id") or "")
+    page_size = 8
+    pages = max(1, (len(models) + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+    current = info.get("model") or {}
+    rows = []
+    for model in models[page * page_size:(page + 1) * page_size]:
+        model_id = model.get("id")
+        mark = "• " if (current.get("providerID") == provider_id
+                        and current.get("id") == model_id) else ""
+        rows.append([{"text": mark + model_id,
+                      "callback_data": f"model:s:{provider_id}:{model_id}"}])
+    nav = []
+    if page > 0:
+        nav.append({"text": "←", "callback_data": f"model:p:{provider_id}:{page - 1}"})
+    nav.append({"text": f"{page + 1}/{pages}",
+                "callback_data": f"model:p:{provider_id}:{page}"})
+    if page + 1 < pages:
+        nav.append({"text": "→", "callback_data": f"model:p:{provider_id}:{page + 1}"})
+    rows.append(nav)
+    rows.append([{"text": "← провайдеры", "callback_data": "model:list"}])
+    tg_send(chat_id, f"Модели {provider.get('name') or provider_id} ({inst['name']}, {sid}):",
+            keyboard={"inline_keyboard": rows})
+    if callback_id:
+        tg("answerCallbackQuery", {"callback_query_id": callback_id})
+
+
+def cb_model_set(chat_id, provider_id, model_id, callback_id=None):
+    inst = get_active()
+    try:
+        sid = target_session(chat_id, inst)
+        with http(f"{inst['url']}/api/session/{sid}/model", method="POST",
+                  body={"model": {"id": model_id, "providerID": provider_id}},
+                  headers=auth_headers(inst)) as r:
+            r.read()
+        print(f"[model:{inst['name']}] chat={chat_id} sid={sid} -> {provider_id}/{model_id}", flush=True)
+        tg_send(chat_id, f"Модель изменена ({inst['name']}, {sid}):\n{provider_id}/{model_id}",
+                keyboard=menu_keyboard())
+    except Exception as e:
+        print(f"[model:{inst['name']}] error: {e}", flush=True)
+        tg_send(chat_id, f"не удалось сменить модель: {e}")
+    if callback_id:
+        tg("answerCallbackQuery", {"callback_query_id": callback_id})
+
+
+def find_provider_for_model(inst, model_id):
+    try:
+        data = oc_providers(inst)
+    except Exception:
+        return None
+    for p in data.get("providers") or []:
+        if model_id in (p.get("models") or {}):
+            return p["id"]
+    return None
+
+
 def handle_callback(cb):
     chat_id = ((cb.get("message") or {}).get("chat") or {}).get("id")
     callback_id = cb.get("id")
@@ -612,6 +745,8 @@ def handle_callback(cb):
         cb_show_menu(chat_id, callback_id)
     elif data == "help":
         cb_help(chat_id, callback_id)
+    elif data == "where":
+        cb_where(chat_id, callback_id)
     elif data == "sess:list":
         cb_session_list(chat_id, callback_id)
     elif data == "sess:new":
@@ -628,6 +763,14 @@ def handle_callback(cb):
         parts = data.split(":", 3)
         if len(parts) == 4:
             cb_permission_reply(chat_id, parts[1], parts[2], parts[3], callback_id)
+    elif data == "model:list":
+        cb_model_list(chat_id, callback_id)
+    elif data.startswith("model:p:"):
+        provider_id, page = data.split("model:p:", 1)[1].rsplit(":", 1)
+        cb_model_page(chat_id, provider_id, int(page), callback_id)
+    elif data.startswith("model:s:"):
+        provider_id, model_id = data.split("model:s:", 1)[1].split(":", 1)
+        cb_model_set(chat_id, provider_id, model_id, callback_id)
     elif data.startswith("sess:use:"):
         name, _, sid = data.split("sess:use:", 1)[1].partition(":")
         inst = inst_by_name(name)
@@ -654,6 +797,8 @@ def handle_command(chat_id, text):
         cb_help(chat_id)
     elif cmd == "/sessions":
         cb_session_list(chat_id)
+    elif cmd == "/where":
+        cb_where(chat_id)
     elif cmd == "/new":
         cb_session_new(chat_id)
     elif cmd == "/abort":
@@ -668,6 +813,19 @@ def handle_command(chat_id, text):
             tg_send(chat_id, f"переключился на {name}", keyboard=menu_keyboard())
         else:
             tg_send(chat_id, f"нет инстанса {name!r}")
+    elif cmd == "/model":
+        arg = parts[1] if len(parts) > 1 else ""
+        if not arg:
+            cb_model_list(chat_id)
+        elif "/" in arg:
+            provider_id, model_id = arg.split("/", 1)
+            cb_model_set(chat_id, provider_id, model_id)
+        else:
+            provider_id = find_provider_for_model(get_active(), arg)
+            if provider_id:
+                cb_model_set(chat_id, provider_id, arg)
+            else:
+                tg_send(chat_id, f"модель {arg!r} не найдена; укажи как provider/model")
     elif cmd == "/stop":
         cb_session_stopall(chat_id)
     elif cmd == "/version":
