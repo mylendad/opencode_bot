@@ -195,13 +195,38 @@ def oc_send_prompt(inst, session_id, text):
         raise RuntimeError(f"opencode вернул {status}")
 
 
+BOT_COMMANDS = [
+    ("start", "меню управления"),
+    ("menu", "меню управления"),
+    ("help", "список команд"),
+    ("sessions", "список сессий"),
+    ("new", "новая сессия"),
+    ("abort", "прервать текущую сессию"),
+    ("clear", "открепить сессию"),
+    ("instances", "список инстансов"),
+    ("use", "переключить инстанс: /use home"),
+    ("stop", "прервать во всех инстансах"),
+]
+
+
+def help_text():
+    lines = ["Команды:"]
+    for name, desc in BOT_COMMANDS:
+        lines.append(f"/{name} — {desc}")
+    lines.append("")
+    lines.append("Любой текст без «/» уходит в текущую сессию opencode.")
+    return "\n".join(lines)
+
+
 def menu_keyboard():
     return {"inline_keyboard": [
         [{"text": "Сессии", "callback_data": "sess:list"},
          {"text": "Новая сессия", "callback_data": "sess:new"}],
         [{"text": "Прервать (abort)", "callback_data": "sess:abort"},
          {"text": "Открепить сессию", "callback_data": "sess:clear"}],
-        [{"text": "Инстансы", "callback_data": "inst:list"}],
+        [{"text": "Инстансы", "callback_data": "inst:list"},
+         {"text": "Стоп во все", "callback_data": "sess:stopall"}],
+        [{"text": "Помощь", "callback_data": "help"}],
     ]}
 
 
@@ -352,6 +377,31 @@ def cb_session_clear(chat_id, callback_id=None):
         tg("answerCallbackQuery", {"callback_query_id": callback_id})
 
 
+def cb_session_stopall(chat_id, callback_id=None):
+    stopped = []
+    for inst in instances:
+        try:
+            sid = oc_find_session(inst)
+            with http(f"{inst['url']}/session/{sid}/abort", method="POST",
+                      headers=auth_headers(inst)) as r:
+                r.read()
+            stopped.append(inst["name"])
+        except Exception:
+            pass
+    if stopped:
+        tg_send(chat_id, "abort отправлен: " + ", ".join(stopped))
+    else:
+        tg_send(chat_id, "не удалось отправить abort ни в один инстанс")
+    if callback_id:
+        tg("answerCallbackQuery", {"callback_query_id": callback_id})
+
+
+def cb_help(chat_id, callback_id=None):
+    tg_send(chat_id, help_text(), keyboard=menu_keyboard())
+    if callback_id:
+        tg("answerCallbackQuery", {"callback_query_id": callback_id})
+
+
 def cb_instance_list(chat_id, callback_id=None):
     inst = get_active()
     rows = []
@@ -385,6 +435,8 @@ def handle_callback(cb):
         return
     if data == "menu":
         cb_show_menu(chat_id, callback_id)
+    elif data == "help":
+        cb_help(chat_id, callback_id)
     elif data == "sess:list":
         cb_session_list(chat_id, callback_id)
     elif data == "sess:new":
@@ -393,6 +445,8 @@ def handle_callback(cb):
         cb_session_abort(chat_id, callback_id)
     elif data == "sess:clear":
         cb_session_clear(chat_id, callback_id)
+    elif data == "sess:stopall":
+        cb_session_stopall(chat_id, callback_id)
     elif data == "inst:list":
         cb_instance_list(chat_id, callback_id)
     elif data.startswith("sess:use:"):
@@ -412,8 +466,10 @@ def handle_callback(cb):
 def handle_command(chat_id, text):
     parts = text.split()
     cmd = parts[0].lower().split("@")[0]
-    if cmd in ("/start", "/menu", "/help"):
+    if cmd in ("/start", "/menu"):
         cb_show_menu(chat_id)
+    elif cmd == "/help":
+        cb_help(chat_id)
     elif cmd == "/sessions":
         cb_session_list(chat_id)
     elif cmd == "/new":
@@ -431,15 +487,7 @@ def handle_command(chat_id, text):
         else:
             tg_send(chat_id, f"нет инстанса {name!r}")
     elif cmd == "/stop":
-        for inst in instances:
-            try:
-                sid = oc_find_session(inst)
-                with http(f"{inst['url']}/session/{sid}/abort", method="POST",
-                          headers=auth_headers(inst)) as r:
-                    r.read()
-            except Exception:
-                pass
-        tg_send(chat_id, "abort отправлен во все инстансы")
+        cb_session_stopall(chat_id)
     else:
         tg_send(chat_id, "неизвестная команда; /help — список")
 
@@ -500,6 +548,9 @@ def main():
         print("нет bot_token в config.json", file=sys.stderr)
         sys.exit(1)
     load_pins()
+    tg("setMyCommands", {"commands": json.dumps(
+        [{"command": name, "description": desc} for name, desc in BOT_COMMANDS]
+    )})
     healthy = []
     for inst in instances:
         try:
