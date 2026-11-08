@@ -1013,8 +1013,8 @@ def cb_permission_reply(chat_id, action, name, pid, callback_id=None):
             with http(f"{inst['url']}/permission/{pid}/reply", method="POST",
                       body={"reply": action}, headers=auth_headers(inst)) as r:
                 r.read()
-            labels = {"once": "разрешено", "always": "разрешено всегда", "reject": "отклонено"}
-            tg_send(chat_id, f"Разрешение {labels[action]} ({name})")
+            labels = {"once": "Разрешено", "always": "Разрешено всегда", "reject": "Отклонено"}
+            tg_send(chat_id, f"{labels[action]} ({name})")
             with lock:
                 notified_perms.discard(pid)
         except Exception as e:
